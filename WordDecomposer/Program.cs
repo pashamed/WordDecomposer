@@ -1,117 +1,90 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 
-string[] simpleWords;
-string[] toDecompose;
-string outputPath = "";
-InitFiles(out simpleWords, out toDecompose, out outputPath);
-
-bool decomposed = false;
-string first = "";
-string second = "";
-string third = "";
-StringBuilder output = new StringBuilder();
-
-Stopwatch sw = Stopwatch.StartNew();
-
-//decomposition loop async parallel
-foreach (string word in toDecompose)
+internal class Program
 {
-    first = await SearchWordAsync(word.Trim(), true);
-    if (word.Length > first.Length && first.Length > 0)
+    private static async Task Main(string[] args)
     {
-        second = await SearchWordAsync(word.Substring(first.Length), true);
-        decomposed = second.Length < 1 ? false : true;
-    }
-    if (word.Length > first.Length + second.Length && decomposed)
-    {
-        third = await SearchWordAsync(word.Substring(first.Length + second.Length), true);
-    }
-    if (decomposed)
-    {
-        output.Append($"{word} --- {first}, {second}, {third} \n");
-        decomposed = false;
-    }
-    second = "";
-    first = "";
-    third = "";
-}
-sw.Stop();
-Console.WriteLine($"Task done in parallel in {sw.Elapsed.TotalSeconds} seconds");
+        ConcurrentDictionary<string, bool> dictionary;
+        string[] toDecompose;
+        string outputPath;
+        InitFiles(out dictionary, out toDecompose, out outputPath);
 
-//writing decomposed words to file
-using (StreamWriter outputWriter = new StreamWriter(outputPath))
-{
-    foreach (ReadOnlyMemory<char> c in output.GetChunks())
-    {
-        outputWriter.Write(c);
-    }
-}
+        StringBuilder output = new StringBuilder();
+        Stopwatch sw = Stopwatch.StartNew();
 
-//seearching for longest word async in Parallel
-//TRUE to return exact word, even if it can be decomposed
-async Task<string> SearchWordAsync(string word, bool findLongest)
-{
-    object wordLock = new object();
-    string longestWord = "";
-    await Task.Run(() =>
-    Parallel.ForEach(simpleWords, compare =>
-    {
-        if (word.StartsWith(compare.ToLower()))
+        ConcurrentBag<string> results = new ConcurrentBag<string>();
+
+        await Task.WhenAll(toDecompose.AsParallel().Select(word => ProcessWordAsync(word, dictionary, results)));
+
+        foreach (var result in results)
         {
-            if (longestWord.Length <= compare.Length && compare.Length <= word.Length && findLongest)
+            output.AppendLine(result);
+        }
+
+        sw.Stop();
+        Console.WriteLine($"Task done in parallel in {sw.Elapsed.TotalSeconds} seconds");
+
+        await File.WriteAllTextAsync(outputPath, output.ToString());
+    }
+
+    private static async Task ProcessWordAsync(string word, ConcurrentDictionary<string, bool> dictionary, ConcurrentBag<string> results)
+    {
+        var decompositions = await DecomposeWordAsync(word, dictionary, new List<string>());
+        if (decompositions.Any())
+        {
+            var result = $"{word} --- {string.Join(", ", decompositions.First())}";
+            results.Add(result);
+        }
+    }
+
+    private static async Task<List<List<string>>> DecomposeWordAsync(string remainingWord, ConcurrentDictionary<string, bool> dictionary, List<string> currentDecomposition)
+    {
+        var decompositions = new List<List<string>>();
+        if (string.IsNullOrEmpty(remainingWord))
+        {
+            decompositions.Add(new List<string>(currentDecomposition));
+            return decompositions;
+        }
+
+        bool foundDecomposition = false;
+
+        for (int i = remainingWord.Length; i > 0; i--)
+        {
+            var subWord = remainingWord.Substring(0, i);
+            if (subWord.Length >= 3 && dictionary.ContainsKey(subWord))
             {
-                lock (wordLock)
+                var newDecomposition = new List<string>(currentDecomposition) { subWord };
+                var subDecompositions = await DecomposeWordAsync(remainingWord.Substring(i), dictionary, newDecomposition);
+                if (subDecompositions.Any())
                 {
-                    longestWord = compare;
-                }               
-            }
-            else if (longestWord.Length <= compare.Length && compare.Length < word.Length)
-            {
-                lock (wordLock)
-                {
-                    longestWord = compare;
+                    decompositions.AddRange(subDecompositions);
+                    foundDecomposition = true;
                 }
             }
         }
-    }));
 
-    return longestWord;
-}
+        if (!foundDecomposition && currentDecomposition.Count > 0)
+        {
+            decompositions.Add(new List<string>(currentDecomposition) { remainingWord });
+        }
 
-//initialization of Working Paths and loading words to memory
-static void InitFiles(out string[] dictionary, out string[] toTest, out string output)
-{
-    string dictionaryPath = "";
-    string testWordPath = "";
-
-    string dictWords;
-    string testWords;
-
-    while (!File.Exists(dictionaryPath))
-    {
-        Console.WriteLine("Provide dictionary path");
-        dictionaryPath = Console.ReadLine();
-    }
-    while (!File.Exists(testWordPath))
-    {
-        Console.WriteLine("Provide test words path");
-        testWordPath = Console.ReadLine();
-    }
-    Console.WriteLine("Provide output file name (will be saved in project directory DATA folder)");
-    output = $"Data/{Console.ReadLine()}.tsv";
-
-
-    using (StreamReader dictReader = new StreamReader(dictionaryPath))
-    {
-        dictWords = dictReader.ReadToEnd();
+        return decompositions;
     }
 
-    using (StreamReader testReader = new StreamReader(testWordPath))
+    private static void InitFiles(out ConcurrentDictionary<string, bool> dictionary, out string[] toTest, out string output)
     {
-        testWords = testReader.ReadToEnd();
-    }
+        string dictionaryPath = "Data/de-dictionary.tsv";
+        string testWordPath = "Data/de-test-words.tsv";
+        output = "Data/output.tsv";
 
-    dictionary = dictWords.Split("\n");
-    toTest = testWords.Split("\r\n");
+        string dictWords = File.ReadAllText(dictionaryPath).ToLowerInvariant();
+        string testWords = File.ReadAllText(testWordPath).ToLowerInvariant();
+
+        var dictEntries = dictWords.Split("\n", StringSplitOptions.RemoveEmptyEntries).Distinct()
+                                   .ToDictionary(word => word.Trim(), word => true);
+        dictionary = new ConcurrentDictionary<string, bool>(dictEntries);
+        toTest = testWords.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+    }
 }
